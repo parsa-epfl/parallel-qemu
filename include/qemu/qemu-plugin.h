@@ -697,6 +697,31 @@ PF_API AARCH64_ONLY_API uint64_t qemu_plugin_read_ttbr_el1(int which_ttbr);
 PF_API AARCH64_ONLY_API uint64_t qemu_plugin_read_tcr_el1(void);
 
 /**
+ * qemu_plugin_read_sctlr_el1 - returns the value of sctlr_el1.
+ *
+ * This function can be only called from threads that run a vCPU. Otherwise, it
+ * will trigger assertion failure.
+ */
+PF_API AARCH64_ONLY_API uint64_t qemu_plugin_read_sctlr_el1(void);
+
+/**
+ * qemu_plugin_read_cpsr - returns the value of CPSR (Current Program Status
+ * Register). In AArch64 this is the PSTATE assembled from its cached fields.
+ *
+ * This function can be only called from threads that run a vCPU. Otherwise, it
+ * will trigger assertion failure.
+ */
+PF_API AARCH64_ONLY_API uint64_t qemu_plugin_read_cpsr(void);
+
+/**
+ * qemu_plugin_read_mair_el1 - returns the value of mair_el1.
+ *
+ * This function can be only called from threads that run a vCPU. Otherwise, it
+ * will trigger assertion failure.
+ */
+PF_API AARCH64_ONLY_API uint64_t qemu_plugin_read_mair_el1(void);
+
+/**
  * qemu_plugin_hwaddr_translate_walk_trace - returns the trace of walking the
  * page table to get the specific translation.
  *
@@ -833,13 +858,13 @@ typedef enum qemu_plugin_snapshot_format_t {
 /**
  * qemu_plugin_savevm - save the VM state.
  * @name: the name of the snapshot.
- * @use_xdelta: whether to use xdelta to save the snapshot.
- * @xdelta_source_name: the name of the source snapshot when using xdelta. Can be null for other cases.
+ * @format: the snapshot format to use.
+ * @generate_gem5_chkpt: whether to generate gem5-compatible checkpoint files (.raw + .register.info).
  *
  * This function is a wrapper of the QEMU function `save_snapshot`.
  * It prints the error directly to the console.
  */
-PF_API void qemu_plugin_savevm(const char *name, qemu_plugin_snapshot_format_t format);
+PF_API void qemu_plugin_savevm(const char *name, qemu_plugin_snapshot_format_t format, bool generate_gem5_chkpt);
 
 PF_API typedef void (*qemu_plugin_event_loop_poll_cb_t)(void);
 
