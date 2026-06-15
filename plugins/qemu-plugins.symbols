@@ -59,4 +59,6 @@
   qemu_plugin_register_periodic_check_cb;
   qemu_plugin_get_vcpu_vtime;
   qemu_plugin_register_flushing_local_tlb_cb;
+  qemu_plugin_notify_fully_warmed;
+  qemu_plugin_pdes_fw_complete;
 };

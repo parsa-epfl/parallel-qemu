@@ -73,11 +73,14 @@
 #include "yank_functions.h"
 #include "sysemu/qtest.h"
 #include "options.h"
+#include "net/pdes-checkpoint.h"
 
 #include "qemu/plugin-pf.h"
 #include "migration/external_snapshot_util.h"
 #include <fcntl.h>
 #include <sys/mman.h>
+
+#include "net/pdes-engine.h"
 
 const unsigned int postcopy_ram_discard_version;
 
@@ -2981,6 +2984,30 @@ static struct {
 bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
                   bool has_devices, strList *devices, SnapshotFormat format, Error **errp)
 {
+    printf("save_snapshot called with name=%s format=%d with number of inflight messages %d and format %d\n", name, format, pdes_inflight_count(), format);
+    PDESEngine *engine = get_singleton_engine();
+    // TODO Need a cleaner way to force all savevms to go to boundry
+    if (engine!= NULL){
+        if (!engine->needs_to_checkpoint){
+            engine->needs_to_checkpoint = true;
+            // Copy the name
+            snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", name ? name : "snapshot");
+            // Copy the format
+            engine->checkpoint_format = format;
+            printf("Savevm: checkpoint requested with name %s and format %d\n", name ? name : "snapshot", format);
+            engine->notified_neighbors = false;
+            // WWT specific
+            PDESWWT *wwt = get_singleton_wwt_engine();
+            engine->checkpoint_quantum_round = wwt->current_quantum_round;
+            return false;
+        }
+    }
+
+    bool validate = validate_checkpoint(&name);
+    if (!validate){
+        return validate;
+    }
+ 
     BlockDriverState *bs;
     QEMUSnapshotInfo sn1, *sn = &sn1;
     int ret = -1, ret2;
@@ -3042,6 +3069,22 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
 
     aio_context_acquire(aio_context);
 
+    
+    // Make sure you send and recieve everything that has been passed.
+    // Based on the sync logic it should be ok if something is processed in between still 
+    if (engine != NULL) {
+        printf("Draining PDESEngine before snapshot\n");
+        int drain_res = pdes_drain(engine, name, format);
+        if (drain_res < 0){
+            printf("Failed to drain PDESEngine before snapshot, error code %d\n", drain_res);
+            return false;
+        }
+    }else{
+        printf("No PDESEngine found, skipping drain\n");
+    }
+    // By here everything that has been passed to the engine should be processed. now we just need to save the devices + timers
+
+
     memset(sn, 0, sizeof(*sn));
 
     /* fill auxiliary fields */
@@ -3061,6 +3104,7 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
         pstrcpy(sn->name, sizeof(sn->name), autoname);
     }
 
+    printf("=============================== savevm log 1 ===============================\n");
     switch (format) {
         case SNAPSHOT_FORMAT_INTERNAL_RAW: {
             f = qemu_fopen_bdrv(bs, 1);
@@ -3093,6 +3137,7 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
 
     }
 
+    printf("=============================== savevm log 2 ===============================\n");
     /* save the VM state */
     if (!f) {
         error_setg(errp, "Could not open VM state file");
@@ -3107,6 +3152,7 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
         dirty_bitmap = memory_region_snapshot_and_clear_dirty(get_main_memory()->mr, 0, get_main_memory()->used_length, DIRTY_MEMORY_MIGRATION);
     }
 
+    printf("=============================== savevm log 3 ===============================\n");
     ret = qemu_savevm_state(f, errp);
     vm_state_size = qemu_file_transferred_noflush(f);
     ret2 = qemu_fclose(f);
@@ -3123,6 +3169,7 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
         goto the_end;
     }
 
+    printf("=============================== savevm log 4 ===============================\n");
     if (format == SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE || format == SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_DELTA) {
         struct RAMBlock *main_ram = get_main_memory();
         if (format == SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE) {
@@ -3245,6 +3292,7 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
         }
     }
 
+    printf("=============================== savevm log 5 ===============================\n");
     if (pf_savevm_cb) {
         pf_savevm_cb(sn->name);
     }
@@ -3266,6 +3314,7 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
 
     ret = 0;
 
+    printf("=============================== savevm log 6 ===============================\n");
  the_end:
     if (aio_context) {
         aio_context_release(aio_context);
@@ -3276,6 +3325,8 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
     if (saved_vm_running) {
         vm_start();
     }
+    
+    printf("=============================== savevm log 7 ===============================\n");
     return ret == 0;
 }
 
@@ -3467,6 +3518,7 @@ static void *uffd_on_demand_thread(void *main_ram) {
 bool load_snapshot(const char *name, const char *vmstate,
                    bool has_devices, strList *devices, int on_demand, Error **errp)
 {
+    PDESEngine *engine = get_singleton_engine();
     BlockDriverState *bs_vm_state;
     QEMUSnapshotInfo sn;
     QEMUFile *f;
@@ -3514,6 +3566,28 @@ bool load_snapshot(const char *name, const char *vmstate,
         error_setg(errp, "This is a disk-only snapshot. Revert to it "
                    " offline using qemu-img");
         return false;
+    }
+
+    if (engine != NULL){
+        // TODO make this usable by any strategy
+        PDESWWT *wwt_engine = get_singleton_wwt_engine();
+        int ret = pdes_inflight_restore_and_schedule(name, wwt_engine->recv_cb, wwt_engine->recv_opaque);
+        if (ret < 0) {
+            error_setg(errp, "Failed to restore in-flight operations for the snapshot");
+            return false;
+        }
+    } else {
+        // No engine to restore into. Fine when the snapshot saved nothing — but if an in-flight
+        // file EXISTS, skipping would silently drop those messages: fail the load instead.
+        char *inflight_file = get_json_file_name(name);
+        bool have_inflight = g_file_test(inflight_file, G_FILE_TEST_IS_REGULAR);
+        g_free(inflight_file);
+        if (have_inflight) {
+            error_setg(errp, "[CKPT-INFLIGHT] %s: in-flight file exists but PDES engine is not "
+                       "initialized at load — messages would be dropped", name);
+            return false;
+        }
+        printf("[CKPT-INFLIGHT] %s: engine not ready at load, no in-flight file - nothing to restore\n", name);
     }
 
     /*

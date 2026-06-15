@@ -33,6 +33,9 @@
 #include "migration/snapshot.h"
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
+#include "net/pdes-engine.h"
+#include "qemu/main-loop.h"
+#include "block/aio.h"
 
 
 // All cyan callback functions
@@ -229,6 +232,34 @@ bool qemu_plugin_register_flushing_local_tlb_cb(
 
   pf_flushing_local_tlb_cb = cb;
   return true;
+}
+
+static void do_notify_fully_warmed_bh(void *opaque) {
+  PDESEngine *engine = opaque;
+  if (engine == NULL) {
+    save_snapshot("init_warmed", true, NULL, false, NULL, SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE, NULL);
+    exit(0);  /* single-node: snapshot written synchronously above; clean-exit like the multi-node master does after init_warmed */
+  } else {
+    finish_initiate_checkpoint(engine);
+  }
+}
+
+/* Deferred so RR doesn't block its own main loop on the cross-node handshake. */
+void qemu_plugin_notify_fully_warmed(void){
+  aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                          do_notify_fully_warmed_bh,
+                          get_singleton_engine());
+}
+
+/* FW periodic-snapshot run complete (replaces the plugin's own exit(0)). Single-node (no engine):
+ * exit(0) here — every snapshot was already written synchronously by its own savevm. Multi-node:
+ * the final snapshot was only ARMED by the caller's savevm; PDES writes it at the next quantum
+ * boundary and then drives a coordinated exit (CTRL_CKP_FINAL -> CTRL_READY/CTRL_CLEANUP), so we
+ * just arm that on the master and return — exiting now would drop the last checkpoint (999-vs-1000). */
+void qemu_plugin_pdes_fw_complete(void){
+  PDESEngine *engine = get_singleton_engine();
+  if (engine == NULL) exit(0);
+  if (engine->master) engine->fw_exit_after_checkpoint = true;
 }
 
 

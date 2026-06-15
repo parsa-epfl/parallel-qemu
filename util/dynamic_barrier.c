@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
+#include "qemu/processor.h"
 
 #include "qemu/osdep.h"
 #include "hw/core/cpu.h"
@@ -13,6 +15,7 @@
 #include "sysemu/runstate.h"
 #include "sysemu/quantum.h"
 #include "qemu/plugin-pf.h"
+#include "net/pdes-engine.h"
 
 
 
@@ -131,7 +134,6 @@ int dynamic_barrier_polling_init(dynamic_barrier_polling_t *barrier, int initial
     barrier->count = 0;
     barrier->return_value.two_32.generation = 0;
     barrier->return_value.two_32.stop_request = 0;
-    barrier->next_virtual_time_deadline_in_ns = 0;
 
     if (quantum_enabled()) {
         // pthread_t tid;
@@ -141,8 +143,6 @@ int dynamic_barrier_polling_init(dynamic_barrier_polling_t *barrier, int initial
     for (int i = 0; i < 128; i++) {
         barrier->histogram[i] = create_histogram(100, 1e5, 101e5);
     }
-
-    barrier->timer_update_request = false;
 
     barrier->current_cycle = 0;
     barrier->next_check_threshold = quantum_check_threshold;
@@ -160,8 +160,17 @@ int dynamic_barrier_polling_destroy(dynamic_barrier_polling_t *barrier) {
 
 static void dynamic_barrier_polling_acquire_lock(dynamic_barrier_polling_t *barrier) {
     uint64_t my_ticket = atomic_fetch_add(&barrier->lock.next_ticket, 1);
+    // Relax/yield ONLY while an MNQ pause is in force: the leader then parks holding this lock
+    // for a full peer-roundtrip and N-1 waiters would burn host cores. Every other wait (single
+    // node: engine==NULL; multi-node outside a pause) keeps the original pure spin, so existing
+    // PWQ paths are untouched.
+    PDESEngine *engine = get_singleton_engine();
+    uint64_t spins = 0;
     while (atomic_load(&barrier->lock.now_serving) != my_ticket) {
-        // do nothing
+        if (engine && qatomic_read(&engine->paused)) {
+            cpu_relax();
+            if (++spins == 10000) { sched_yield(); spins = 0; }
+        }
     }
 }
 
@@ -169,7 +178,7 @@ static void dynamic_barrier_polling_release_lock(dynamic_barrier_polling_t *barr
     atomic_fetch_add(&barrier->lock.now_serving, 1);
 }
 
-uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32_t private_generation, int *stop_request, bool check_time) {
+uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32_t private_generation, int *stop_request) {
     assert(current_cpu != NULL);
 
     dynamic_barrier_polling_acquire_lock(barrier);
@@ -177,10 +186,6 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
     uint32_t current_gen = atomic_load(&barrier->return_value.two_32.generation);
 
     assert(private_generation == current_gen);
-
-    if (check_time) {
-        barrier->timer_update_request = true;
-    }
 
     uint64_t waiting_count = barrier->count;
 
@@ -196,29 +201,33 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
             return current_gen; // abandon the current quantum.
         }
 
+        /* MNQ cooperative pause: leader holds the global clock while engine->paused. Longest
+         * wait in the system (a full peer-roundtrip) — relax/yield frees the host core with no
+         * semantic change: the clock only advances after this loop, so the guest stays frozen. */
+        PDESEngine *engine = get_singleton_engine();
+        uint64_t pause_spins = 0;
+        while (engine && qatomic_read(&engine->paused)) {
+            if (!runstate_is_running()) {
+                *stop_request = 2;
+                dynamic_barrier_polling_release_lock(barrier);
+                return current_gen;
+            }
+            cpu_relax();
+            if (++pause_spins == 10000) { sched_yield(); pause_spins = 0; }
+        }
+
         barrier->count = 0;
 
         // Advance the virtual clock by the quantum size.
 
-        int64_t current_virtual_time = increase_quantum_time();
-        barrier->next_virtual_time_deadline_in_ns -= quantum_size;
+        increase_quantum_time();
 
-        if (barrier->timer_update_request || barrier->next_virtual_time_deadline_in_ns <= 0) {
+        if (qemu_clock_expired(QEMU_CLOCK_VIRTUAL)) {
             qemu_mutex_lock_iothread();
             qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
             qemu_mutex_unlock_iothread();
-
-            int64_t deadline = qemu_clock_deadline_ns_virtual_clock_for_quantum(current_virtual_time);
-
-            if (deadline < 0) {
-                assert(!runstate_is_running());
-            } else {
-                barrier->next_virtual_time_deadline_in_ns = deadline;
-            }
         }
 
-
-        barrier->timer_update_request = false;
 
         // Then, run the periodic check.
         if (barrier->next_check_threshold != 0 && barrier->current_cycle >= barrier->next_check_threshold) {
@@ -229,9 +238,10 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
                     qemu_notify_event();
 
                     // wait for the machine state to become suspended for VM.
-                    while (current_cpu->stop != true) {
-                        sched_yield();
-                    }
+                    // TODO check if we need to still do this in single node (+ checkpointing on single node in general)
+                    // while (current_cpu->stop != true) {
+                    //     sched_yield();
+                    // }
                 }
             }
             barrier->next_check_threshold += quantum_check_threshold;

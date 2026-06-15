@@ -39,6 +39,7 @@
 #include "sysemu/cpu-timers.h"
 #include "sysemu/cpu-throttle.h"
 #include "timers-state.h"
+#include "net/pdes-engine.h"
 
 /*
  * ICOUNT: Instruction Counter
@@ -47,6 +48,10 @@
  * is TCG-specific, and does not need to be built for other accels.
  */
 static bool icount_sleep = true;
+void icount_set_sleep(bool sleep)
+{
+    icount_sleep = sleep;
+}
 /* Arbitrarily pick 1MIPS as the minimum allowable speed.  */
 #define MAX_ICOUNT_SHIFT 10
 
@@ -322,7 +327,20 @@ void icount_start_warp_timer(void)
     }
 
     if (replay_mode != REPLAY_MODE_PLAY) {
+        // TODO : this is running on main loop so no race condition but later on we should add locks for flags on flexus_api
+        // If all cpus are paused, but flexus is not, icount will be progressed by it so there is no ned for warping due to hlt
+        bool pdes_paused = false;
+        PDESEngine* engine = get_singleton_engine();
+        if (engine != NULL) {
+            pdes_paused = qatomic_read(&engine->paused);
+        }
         if (!all_cpu_threads_idle()) {
+            return;
+        }
+
+        // if we are in pause, no need to warp
+        if (pdes_paused){
+            qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
             return;
         }
 
